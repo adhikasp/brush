@@ -177,14 +177,22 @@ pub fn compose_std_command<S: AsRef<OsStr>, SE: extensions::ShellExtensions>(
     args: &[S],
     empty_env: bool,
 ) -> Result<std::process::Command, error::Error> {
-    let mut cmd = std::process::Command::new(command_name);
+    #[cfg(windows)]
+    let mut cmd = compose_windows_command(command_name, argv0, args);
 
-    // Override argv[0].
-    // NOTE: Not supported on all platforms.
-    cmd.arg0(argv0);
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new(command_name);
 
-    // Pass through args.
-    cmd.args(args);
+        // Override argv[0].
+        // NOTE: Not supported on all platforms.
+        cmd.arg0(argv0);
+
+        // Pass through args.
+        cmd.args(args);
+
+        cmd
+    };
 
     // Use the shell's current working dir.
     cmd.current_dir(context.shell.working_dir());
@@ -870,4 +878,98 @@ fn try_unwrap_bare_input_redir_program(program: &ast::Program) -> Option<&ast::I
         ) if fd.is_none_or(|fd| fd == openfiles::OpenFiles::STDIN_FD) => Some(redir),
         _ => None,
     }
+}
+
+/// Composes a command on Windows, working around two gaps that bite PATH-resolved
+/// executables there.
+///
+/// `CreateProcess` appends `.exe` to an extensionless name; brush's path search can hand
+/// back the extensionless sh shim an npm-style install puts next to `npm.cmd` (e.g. the
+/// `npm` shell script), which then fails with "not a valid Win32 application". And a
+/// `.cmd`/`.bat` file is not a PE image at all, so it has to be handed to `cmd.exe`.
+#[cfg(windows)]
+fn compose_windows_command<S: AsRef<OsStr>>(
+    command_name: &str,
+    argv0: &str,
+    args: &[S],
+) -> std::process::Command {
+    let program = resolve_windows_program(command_name);
+
+    let is_script = program
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+
+    if is_script && let Some(comspec) = std::env::var_os("COMSPEC") {
+        let mut cmd = std::process::Command::new(comspec);
+        cmd.arg("/d").arg("/s").arg("/c");
+
+        // `raw_arg` appends verbatim, so the quoting below is the command line cmd.exe sees.
+        let mut line = String::from("\"");
+        line.push_str(&quote_for_cmd(&program.to_string_lossy()));
+        for arg in args {
+            line.push(' ');
+            line.push_str(&quote_for_cmd(&arg.as_ref().to_string_lossy()));
+        }
+        line.push('"');
+
+        std::os::windows::process::CommandExt::raw_arg(&mut cmd, line);
+        return cmd;
+    }
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.arg0(argv0);
+    cmd.args(args);
+    cmd
+}
+
+/// Appends a Windows executable extension to a bare name the way `CreateProcess` would,
+/// but keeps `.cmd`/`.bat` as candidates instead of stopping at a non-PE file.
+#[cfg(windows)]
+fn resolve_windows_program(command_name: &str) -> PathBuf {
+    let path = PathBuf::from(command_name);
+    if path.extension().is_some() {
+        return path;
+    }
+
+    for ext in ["exe", "cmd", "bat", "com"] {
+        let mut candidate = path.clone().into_os_string();
+        candidate.push(".");
+        candidate.push(ext);
+        let candidate = PathBuf::from(candidate);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    path
+}
+
+/// Quotes one argument for `cmd.exe /c`, which parses a command line rather than argv.
+/// Embedded quotes are doubled; everything else inside quotes is literal. `%` expansion
+/// inside quotes is the known limit of this approach.
+#[cfg(windows)]
+fn quote_for_cmd(arg: &str) -> String {
+    if arg.is_empty() {
+        return String::from("\"\"");
+    }
+
+    let needs_quotes = arg
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    for c in arg.chars() {
+        if c == '"' {
+            quoted.push_str("\"\"");
+        } else {
+            quoted.push(c);
+        }
+    }
+    quoted.push('"');
+    quoted
 }
